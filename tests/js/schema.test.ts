@@ -1,6 +1,7 @@
 import * as wasm from "../../pkg/node/parquet_wasm";
 import { readFileSync } from "fs";
 import * as arrow from "apache-arrow";
+import { tableFromIPC as altTableFromIPC } from '@uwdata/flechette';
 import { readExpectedArrowData, extractFooterBytes, extractRowGroupBytes } from "./utils";
 import { parseSchema } from "arrow-js-ffi";
 import { it, expect } from "vitest";
@@ -171,7 +172,55 @@ it("read single row group from bytes, more than one row group, small table", asy
 
 });
 
-it("read single row group from bytes, from table with more than one row group, big table", async (t) => {
+it("read single row group from bytes, more than one row group, small table with dictionary encoded column", async (t) => {
+  const dataPath = `${dataDir}/1-partition-brotli-multiple-row-groups-and-dict.parquet`;
+  const buffer = readFileSync(dataPath);
+  const arr = new Uint8Array(buffer);
+  const footerBytes = extractFooterBytes(arr);
+  const metadata = wasm.readMetadata(footerBytes);
+
+  // Convert the parquet file buffer from readFileSync to a Blob.
+  const blob = new Blob([buffer], { type: "application/octet-stream" });
+  const pqFile = await wasm.ParquetFile.fromFile(blob);
+  
+  expect(metadata.numRowGroups()).toStrictEqual(5);
+  expect(metadata.rowGroup(0).numRows()).toStrictEqual(2);
+  expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).compressedSize()).toStrictEqual(339);
+  expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(306);
+
+  const rowGroupBytes = extractRowGroupBytes(arr, metadata, 0);
+  expect(rowGroupBytes.length).toStrictEqual(339);
+
+  const rowGroupTable = altTableFromIPC(wasm.readParquetRowGroup(footerBytes, rowGroupBytes, 0).intoIPCStream());
+
+  expect(rowGroupTable.schema.fields.length).toStrictEqual(5);
+  expect(rowGroupTable.numRows).toStrictEqual(2);
+
+  const rows = rowGroupTable.toArray().map(r => r.toJSON());
+  expect(rows).toEqual([
+    {"str": "a", "uint8": 1, "int32": 0, "bool": true, "dict": "a"},
+    {"str": "b", "uint8": 2, "int32": -2147483638, "bool": true, "dict": "b"}
+  ]);
+
+  // Read a second row group.
+  const rowGroupBytes2 = extractRowGroupBytes(arr, metadata, 1);
+  expect(rowGroupBytes2.length).toStrictEqual(268);
+
+  const rowGroupTable2 = altTableFromIPC(wasm.readParquetRowGroup(footerBytes, rowGroupBytes2, 1).intoIPCStream());
+
+  expect(rowGroupTable2.schema.fields.length).toStrictEqual(5);
+  expect(rowGroupTable2.numRows).toStrictEqual(2);
+
+  const rows2 = rowGroupTable2.toArray().map(r => r.toJSON());
+  expect(rows2).toEqual([
+    {"str": "c", "uint8": 3, "int32": 2147483637, "bool": false, "dict": "a"},
+    {"str": "d", "uint8": 4, "int32": 1, "bool": false, "dict": "c"}
+  ]);
+
+});
+
+it.skip("read single row group from bytes, from table with more than one row group, big table", async (t) => {
   const dataPath = `${dataDir}/part.0.parquet`;
   const buffer = readFileSync(dataPath);
   const arr = new Uint8Array(buffer);

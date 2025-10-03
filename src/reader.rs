@@ -78,13 +78,17 @@ impl PageIterator for ColumnChunkIterator {}
 #[derive(Clone)]
 pub struct ColumnChunkData {
     offset: usize,
+    row_group_offset: usize,
     data: Bytes,
 }
 
 impl ColumnChunkData {
     fn get(&self, start: u64) -> parquet::errors::Result<Bytes> {
-        let start = start as usize - self.offset;
-        Ok(self.data.slice(start..))
+        let adjusted_start = start as usize - self.offset;
+        
+        //let start: usize = start as usize - self.offset;
+        crate::log!("ColumnChunkData get: start {}, adjusted_start {}", start, adjusted_start);
+        Ok(self.data.slice(adjusted_start..))
     }
 }
 
@@ -146,62 +150,27 @@ impl InMemoryRowGroup {
         let row_group_offset = metadata.file_offset().unwrap() as u64;
         crate::log!("Row group offset: {}", row_group_offset);
 
-        // Create a fresh RowGroupMetaData to ensure no incorrect byte offsets are included in the row group metadata, or its column metadata.
-        // We need to adjust the offsets.
-        let mut row_group_builder = metadata.into_builder();
-        row_group_builder = row_group_builder.set_file_offset(0);
-        row_group_builder = row_group_builder.set_total_byte_size(row_group_bytes.len() as i64);
-        for column in row_group_builder.take_columns() {
-            let orig_data_page_offset = column.data_page_offset();
-            let orig_index_page_offset = column.index_page_offset();
-            let orig_dictionary_page_offset = column.dictionary_page_offset();
-            let orig_column_index_offset = column.column_index_offset();
-            let orig_offset_index_offset = column.offset_index_offset();
-            let orig_bloom_filter_offset = column.bloom_filter_offset();
-
-            let adjusted_data_page_offset = orig_data_page_offset - row_group_offset as i64;
-            let adjusted_index_page_offset = orig_index_page_offset.map(|o| o - row_group_offset as i64);
-            let adjusted_dictionary_page_offset = orig_dictionary_page_offset.map(|o| o - row_group_offset as i64);
-            let adjusted_column_index_offset = orig_column_index_offset.map(|o| o - row_group_offset as i64);
-            let adjusted_offset_index_offset = orig_offset_index_offset.map(|o| o - row_group_offset as i64);
-            let adjusted_bloom_filter_offset = orig_bloom_filter_offset.map(|o| o - row_group_offset as i64);
-            
-            let column = column.into_builder()
-                .set_data_page_offset(adjusted_data_page_offset)
-                .set_index_page_offset(adjusted_index_page_offset)
-                .set_dictionary_page_offset(adjusted_dictionary_page_offset)
-                .set_column_index_offset(adjusted_column_index_offset)
-                .set_offset_index_offset(adjusted_offset_index_offset)
-                .set_bloom_filter_offset(adjusted_bloom_filter_offset)
-                .build()
-                .unwrap();
-            row_group_builder = row_group_builder.add_column_metadata(column);
-        }
-        let new_metadata = row_group_builder
-            .build()
-            .unwrap();
-
-        for (leaf_idx, meta) in new_metadata.columns().iter().enumerate() {
+        for (leaf_idx, meta) in metadata.columns().iter().enumerate() {
             if mask.leaf_included(leaf_idx) {
                 let (start, len) = meta.byte_range();
-                crate::log!("Column {}: start {}, len {}", leaf_idx, start, len);
+                let adjusted_start = start - row_group_offset;
+                crate::log!("Column {}: start {}, len {}, adjusted_start {}", leaf_idx, start, len, adjusted_start);
 
                 //let data = reader.get_bytes(start..(start + len)).await?;
                 // Do we need to use start/offset here, since row_group_bytes is already sliced to the row group?
                 // Or, are we slicing into the column chunk data. Do we need to subtract the row group start offset?
-                let data = Bytes::copy_from_slice(&row_group_bytes[start as usize..(start + len) as usize]);
+                let data = Bytes::copy_from_slice(&row_group_bytes[adjusted_start as usize..(adjusted_start + len) as usize]);
 
                 column_chunks[leaf_idx] = Some(Arc::new(ColumnChunkData {
                     offset: start as usize,
+                    row_group_offset: row_group_offset as usize,
                     data,
                 }));
             }
         }
 
-        
-
         Self {
-            metadata: new_metadata,
+            metadata,
             column_chunks,
         }
     }
@@ -235,7 +204,7 @@ pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, r
     let batch_size = 1024; // TODO: allow user to specify batch size
     let selection = None; // TODO: allow user to specify row selection
 
-    let reader = ParquetRecordBatchReader::try_new_with_row_groups(&levels, &row_groups, batch_size, selection)?;
+    let reader: ParquetRecordBatchReader = ParquetRecordBatchReader::try_new_with_row_groups(&levels, &row_groups, batch_size, selection)?;
 
     let mut batches = vec![];
 
@@ -248,7 +217,7 @@ pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, r
         schema.fields().clone(),
     ));
     
-    let table = Table::new(new_schema, batches);
+    let table = Table::new(schema, batches);
 
     Ok(table)
 }
