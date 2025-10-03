@@ -162,6 +162,12 @@ impl RowGroupMetaData {
     pub fn compressed_size(&self) -> f64 {
         self.0.compressed_size() as f64
     }
+
+    /// File offset of this row group in file.
+    #[wasm_bindgen(js_name = fileOffset)]
+    pub fn file_offset(&self) -> Option<f64> {
+        self.0.file_offset().map(|v| v as f64)
+    }
 }
 
 impl From<parquet::file::metadata::RowGroupMetaData> for RowGroupMetaData {

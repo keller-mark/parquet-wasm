@@ -59,6 +59,8 @@ it("read metadata from full file bytes", async (t) => {
   expect(metadata.numRowGroups()).toStrictEqual(1);
   expect(metadata.numRowGroups()).toStrictEqual(expectedMetadata.numRowGroups());
   expect(metadata.rowGroup(0).numRows()).toStrictEqual(expectedMetadata.rowGroup(0).numRows());
+  expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(269);
 });
 
 it("read metadata from footer bytes only", async (t) => {
@@ -80,4 +82,6 @@ it("read metadata from footer bytes only", async (t) => {
   expect(metadata.numRowGroups()).toStrictEqual(1);
   expect(metadata.numRowGroups()).toStrictEqual(expectedMetadata.numRowGroups());
   expect(metadata.rowGroup(0).numRows()).toStrictEqual(expectedMetadata.rowGroup(0).numRows());
+  expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(269);
 });
