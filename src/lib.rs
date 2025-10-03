@@ -2,6 +2,7 @@ extern crate web_sys;
 
 pub mod common;
 pub mod utils;
+pub mod page_reader;
 
 pub mod error;
 pub mod metadata;

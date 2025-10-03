@@ -97,6 +97,9 @@ impl Length for ColumnChunkData {
 impl ChunkReader for ColumnChunkData {
     type T = bytes::buf::Reader<Bytes>;
 
+    // TODO: Try modifying ChunkReader to always adjust its start by the offset.
+    // Then, we may not need to adjust anything anywhere else?
+
     fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
         Ok(self.get(start)?.reader())
     }
@@ -127,6 +130,8 @@ impl RowGroups for InMemoryRowGroup {
                     data.clone(),
                     self.metadata.column(i),
                     self.num_rows(),
+                    // TODO: need to override the SerializedPageReader implementation to adjust for byte offsets in pages.
+
                     None,
                 )?);
 
@@ -158,6 +163,21 @@ impl InMemoryRowGroup {
             let orig_column_index_offset = column.column_index_offset();
             let orig_offset_index_offset = column.offset_index_offset();
             let orig_bloom_filter_offset = column.bloom_filter_offset();
+
+            let column_name = column.column_descr().name();
+            let column_type = column.column_descr().self_type().get_basic_info().name();
+
+            if let Some(dict_offset) = orig_dictionary_page_offset {
+                let data_offset = orig_data_page_offset;
+                crate::log!("Column {}: dictionary_offset={}, data_offset={}, type={}", column_name, dict_offset, data_offset, column_type);
+                
+                // Check if dictionary is before the row group start
+                if dict_offset < row_group_offset as i64 {
+                    crate::log!("WARNING: Dictionary page is before row group start!");
+                }
+            } else {
+                crate::log!("Column {}: no dictionary, type={}", column_name, column_type);
+            }
 
             let adjusted_data_page_offset = orig_data_page_offset - row_group_offset as i64;
             let adjusted_index_page_offset = orig_index_page_offset.map(|o| o - row_group_offset as i64);
