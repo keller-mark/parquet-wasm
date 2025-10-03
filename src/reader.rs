@@ -9,7 +9,7 @@ use parquet::arrow::arrow_reader::{
 };
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 use parquet::arrow::{parquet_to_arrow_field_levels, ProjectionMask};
-use parquet::file::metadata::RowGroupMetaData;
+use parquet::file::metadata::{RowGroupMetaData, RowGroupMetaDataBuilder, ColumnChunkMetaData, ColumnChunkMetaDataBuilder};
 use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowGroups, RowSelection};
 use parquet::column::page::{PageIterator, PageReader};
 use parquet::file::reader::{ChunkReader, Length};
@@ -142,20 +142,54 @@ impl InMemoryRowGroup {
     pub fn new(metadata: RowGroupMetaData, mask: ProjectionMask, row_group_bytes: Vec<u8>) -> Self {
         let mut column_chunks: Vec<Option<Arc<ColumnChunkData>>> = metadata.columns().iter().map(|_| None).collect::<Vec<_>>();
 
+        crate::log!("Row group bytes length: {}", row_group_bytes.len());
         let row_group_offset = metadata.file_offset().unwrap() as u64;
         crate::log!("Row group offset: {}", row_group_offset);
 
-        for (leaf_idx, meta) in metadata.columns().iter().enumerate() {
+        // Create a fresh RowGroupMetaData to ensure no incorrect byte offsets are included in the row group metadata, or its column metadata.
+        // We need to adjust the offsets.
+        let mut row_group_builder = metadata.into_builder();
+        row_group_builder = row_group_builder.set_file_offset(0);
+        row_group_builder = row_group_builder.set_total_byte_size(row_group_bytes.len() as i64);
+        for column in row_group_builder.take_columns() {
+            let orig_data_page_offset = column.data_page_offset();
+            let orig_index_page_offset = column.index_page_offset();
+            let orig_dictionary_page_offset = column.dictionary_page_offset();
+            let orig_column_index_offset = column.column_index_offset();
+            let orig_offset_index_offset = column.offset_index_offset();
+            let orig_bloom_filter_offset = column.bloom_filter_offset();
+
+            let adjusted_data_page_offset = orig_data_page_offset - row_group_offset as i64;
+            let adjusted_index_page_offset = orig_index_page_offset.map(|o| o - row_group_offset as i64);
+            let adjusted_dictionary_page_offset = orig_dictionary_page_offset.map(|o| o - row_group_offset as i64);
+            let adjusted_column_index_offset = orig_column_index_offset.map(|o| o - row_group_offset as i64);
+            let adjusted_offset_index_offset = orig_offset_index_offset.map(|o| o - row_group_offset as i64);
+            let adjusted_bloom_filter_offset = orig_bloom_filter_offset.map(|o| o - row_group_offset as i64);
+            
+            let column = column.into_builder()
+                .set_data_page_offset(adjusted_data_page_offset)
+                .set_index_page_offset(adjusted_index_page_offset)
+                .set_dictionary_page_offset(adjusted_dictionary_page_offset)
+                .set_column_index_offset(adjusted_column_index_offset)
+                .set_offset_index_offset(adjusted_offset_index_offset)
+                .set_bloom_filter_offset(adjusted_bloom_filter_offset)
+                .build()
+                .unwrap();
+            row_group_builder = row_group_builder.add_column_metadata(column);
+        }
+        let new_metadata = row_group_builder
+            .build()
+            .unwrap();
+
+        for (leaf_idx, meta) in new_metadata.columns().iter().enumerate() {
             if mask.leaf_included(leaf_idx) {
                 let (start, len) = meta.byte_range();
-                let adjusted_start = start - row_group_offset;
-                crate::log!("Column {}: start {}, len {}, adjusted_start {}", leaf_idx, start, len, adjusted_start);
-                crate::log!("Row group bytes length: {}", row_group_bytes.len());
+                crate::log!("Column {}: start {}, len {}", leaf_idx, start, len);
 
                 //let data = reader.get_bytes(start..(start + len)).await?;
                 // Do we need to use start/offset here, since row_group_bytes is already sliced to the row group?
                 // Or, are we slicing into the column chunk data. Do we need to subtract the row group start offset?
-                let data = Bytes::copy_from_slice(&row_group_bytes[adjusted_start as usize..(adjusted_start + len) as usize]);
+                let data = Bytes::copy_from_slice(&row_group_bytes[start as usize..(start + len) as usize]);
 
                 column_chunks[leaf_idx] = Some(Arc::new(ColumnChunkData {
                     offset: start as usize,
@@ -164,8 +198,10 @@ impl InMemoryRowGroup {
             }
         }
 
+        
+
         Self {
-            metadata,
+            metadata: new_metadata,
             column_chunks,
         }
     }
@@ -175,13 +211,14 @@ impl InMemoryRowGroup {
 /// Internal function to read a buffer with Parquet data into a buffer with Arrow IPC Stream data
 pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, row_group_index: usize, options: JsReaderOptions) -> Result<Table> {
     // Create Parquet reader
-    let f_cursor: Bytes = footer_bytes.into();
+    let m_cursor: Bytes = footer_bytes.clone().into();
+    let s_cursor: Bytes = footer_bytes.into();
     let rg_cursor: Bytes = row_group_bytes.into();
 
-    let metadata = ArrowReaderMetadata::load(&f_cursor, Default::default())?;
+    let metadata = ArrowReaderMetadata::load(&m_cursor, Default::default())?;
     let metadata = cast_metadata_view_types(&metadata)?;
 
-    let schema_builder = ParquetRecordBatchReaderBuilder::try_new(f_cursor)?;
+    let schema_builder = ParquetRecordBatchReaderBuilder::try_new(s_cursor)?;
     let schema = schema_builder.schema().clone();
 
     let row_group_metadata: RowGroupMetaData = metadata.metadata().row_group(row_group_index).clone().into();
@@ -206,7 +243,14 @@ pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, r
         batches.push(maybe_chunk?)
     }
 
-    Ok(Table::new(schema, batches))
+    // Create a new schema to ensure no incorrect byte offsets are included. TODO: is this necessary?
+    let new_schema = arrow_schema::SchemaRef::new(arrow_schema::Schema::new(
+        schema.fields().clone(),
+    ));
+    
+    let table = Table::new(new_schema, batches);
+
+    Ok(table)
 }
 
 /// Internal function to read a buffer with Parquet data into an Arrow schema
