@@ -1,3 +1,4 @@
+import * as wasm from "../../pkg/node/parquet_wasm";
 import { expect } from "vitest";
 import { readFileSync } from "fs";
 import { tableFromIPC, Table } from "apache-arrow";
@@ -74,6 +75,15 @@ export async function temporaryServer() {
     host: "localhost",
   });
   return server as FastifyInstance;
+}
+
+export function extractRowGroupBytes(parquetFile: Uint8Array, metadata: wasm.ParquetMetaData, rowGroupIndex: number): Uint8Array {
+  const rowGroup = metadata.rowGroup(rowGroupIndex);
+  const fileOffset = rowGroup.fileOffset();
+  const totalByteSize = rowGroup.totalByteSize();
+  const compressedSize = rowGroup.compressedSize();
+  // TODO: use compressedSize or totalByteSize?
+  return parquetFile.slice(fileOffset, fileOffset + compressedSize);
 }
 
 export function extractFooterBytes(parquetFile: Uint8Array): Uint8Array {

@@ -4,11 +4,17 @@ use crate::error::Result;
 use crate::read_options::JsReaderOptions;
 use arrow_schema::{DataType, FieldRef};
 use arrow_wasm::{Schema, Table};
-use bytes::Bytes;
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
+use parquet::arrow::{parquet_to_arrow_field_levels, ProjectionMask};
+use parquet::file::metadata::RowGroupMetaData;
+use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, RowGroups, RowSelection};
+use parquet::column::page::{PageIterator, PageReader};
+use parquet::file::reader::{ChunkReader, Length};
+use parquet::file::serialized_reader::SerializedPageReader;
+use bytes::{Buf, Bytes};
 
 /// Internal function to read a buffer with Parquet data into a buffer with Arrow IPC Stream data
 pub fn read_parquet(parquet_file: Vec<u8>, options: JsReaderOptions) -> Result<Table> {
@@ -40,6 +46,159 @@ pub fn read_parquet(parquet_file: Vec<u8>, options: JsReaderOptions) -> Result<T
 
     // Create Arrow reader
     let reader = builder.build()?;
+
+    let mut batches = vec![];
+
+    for maybe_chunk in reader {
+        batches.push(maybe_chunk?)
+    }
+
+    Ok(Table::new(schema, batches))
+}
+
+
+// Reference: https://github.com/apache/arrow-rs/blob/cbf8045e2f74398196a1408bc4ebd0c4d23afc66/parquet/examples/read_with_rowgroup.rs#L101
+
+/// Implements [`PageIterator`] for a single column chunk, yielding a single [`PageReader`]
+struct ColumnChunkIterator {
+    reader: Option<parquet::errors::Result<Box<dyn PageReader>>>,
+}
+
+impl Iterator for ColumnChunkIterator {
+    type Item = parquet::errors::Result<Box<dyn PageReader>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.take()
+    }
+}
+
+impl PageIterator for ColumnChunkIterator {}
+
+/// An in-memory column chunk
+#[derive(Clone)]
+pub struct ColumnChunkData {
+    offset: usize,
+    data: Bytes,
+}
+
+impl ColumnChunkData {
+    fn get(&self, start: u64) -> parquet::errors::Result<Bytes> {
+        let start = start as usize - self.offset;
+        Ok(self.data.slice(start..))
+    }
+}
+
+impl Length for ColumnChunkData {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
+}
+
+impl ChunkReader for ColumnChunkData {
+    type T = bytes::buf::Reader<Bytes>;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<Self::T> {
+        Ok(self.get(start)?.reader())
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<Bytes> {
+        Ok(self.get(start)?.slice(..length))
+    }
+}
+
+#[derive(Clone)]
+pub struct InMemoryRowGroup {
+    pub metadata: RowGroupMetaData,
+    column_chunks: Vec<Option<Arc<ColumnChunkData>>>,
+}
+
+impl RowGroups for InMemoryRowGroup {
+    fn num_rows(&self) -> usize {
+        self.metadata.num_rows() as usize
+    }
+
+    fn column_chunks(&self, i: usize) -> parquet::errors::Result<Box<dyn PageIterator>> {
+        match &self.column_chunks[i] {
+            None => Err(parquet::errors::ParquetError::General(format!(
+                "Invalid column index {i}, column was not fetched"
+            ))),
+            Some(data) => {
+                let page_reader: Box<dyn PageReader> = Box::new(SerializedPageReader::new(
+                    data.clone(),
+                    self.metadata.column(i),
+                    self.num_rows(),
+                    None,
+                )?);
+
+                Ok(Box::new(ColumnChunkIterator {
+                    reader: Some(Ok(page_reader)),
+                }))
+            }
+        }
+    }
+}
+
+impl InMemoryRowGroup {
+    pub fn new(metadata: RowGroupMetaData, mask: ProjectionMask, row_group_bytes: Vec<u8>) -> Self {
+        let mut column_chunks: Vec<Option<Arc<ColumnChunkData>>> = metadata.columns().iter().map(|_| None).collect::<Vec<_>>();
+
+        let row_group_offset = metadata.file_offset().unwrap() as u64;
+        crate::log!("Row group offset: {}", row_group_offset);
+
+        for (leaf_idx, meta) in metadata.columns().iter().enumerate() {
+            if mask.leaf_included(leaf_idx) {
+                let (start, len) = meta.byte_range();
+                let adjusted_start = start - row_group_offset;
+                crate::log!("Column {}: start {}, len {}, adjusted_start {}", leaf_idx, start, len, adjusted_start);
+                crate::log!("Row group bytes length: {}", row_group_bytes.len());
+
+                //let data = reader.get_bytes(start..(start + len)).await?;
+                // Do we need to use start/offset here, since row_group_bytes is already sliced to the row group?
+                // Or, are we slicing into the column chunk data. Do we need to subtract the row group start offset?
+                let data = Bytes::copy_from_slice(&row_group_bytes[adjusted_start as usize..(adjusted_start + len) as usize]);
+
+                column_chunks[leaf_idx] = Some(Arc::new(ColumnChunkData {
+                    offset: start as usize,
+                    data,
+                }));
+            }
+        }
+
+        Self {
+            metadata,
+            column_chunks,
+        }
+    }
+
+}
+
+/// Internal function to read a buffer with Parquet data into a buffer with Arrow IPC Stream data
+pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, row_group_index: usize, options: JsReaderOptions) -> Result<Table> {
+    // Create Parquet reader
+    let f_cursor: Bytes = footer_bytes.into();
+    let rg_cursor: Bytes = row_group_bytes.into();
+
+    let metadata = ArrowReaderMetadata::load(&f_cursor, Default::default())?;
+    let metadata = cast_metadata_view_types(&metadata)?;
+
+    let schema_builder = ParquetRecordBatchReaderBuilder::try_new(f_cursor)?;
+    let schema = schema_builder.schema().clone();
+
+    let row_group_metadata: RowGroupMetaData = metadata.metadata().row_group(row_group_index).clone().into();
+    let mask = ProjectionMask::all(); // TODO: allow user to specify columns to read
+
+    // Create Arrow reader for single row group
+    let levels = parquet_to_arrow_field_levels(
+        &row_group_metadata.schema_descr_ptr(),
+        mask.clone(),
+        None,
+    )?;
+
+    let row_groups = InMemoryRowGroup::new(row_group_metadata, mask.clone(), rg_cursor.to_vec());
+    let batch_size = 1024; // TODO: allow user to specify batch size
+    let selection = None; // TODO: allow user to specify row selection
+
+    let reader = ParquetRecordBatchReader::try_new_with_row_groups(&levels, &row_groups, batch_size, selection)?;
 
     let mut batches = vec![];
 

@@ -76,6 +76,22 @@ pub fn read_parquet(parquet_file: Vec<u8>, options: Option<ReaderOptions>) -> Wa
     )?)
 }
 
+#[wasm_bindgen(js_name = readParquetRowGroup)]
+#[cfg(feature = "reader")]
+pub fn read_parquet_row_group(footer_bytes: Vec<u8>, row_group_bytes: Vec<u8>, row_group_index: usize, options: Option<ReaderOptions>) -> WasmResult<Table> {
+    assert_parquet_file_not_empty(footer_bytes.as_slice())?;
+
+    Ok(crate::reader::read_parquet_row_group(
+        footer_bytes,
+        row_group_bytes,
+        row_group_index,
+        options
+            .map(|x| x.try_into())
+            .transpose()?
+            .unwrap_or_default(),
+    )?)
+}
+
 /// Read an Arrow schema from a Parquet file in memory.
 ///
 /// This returns an Arrow schema in WebAssembly memory. To transfer the Arrow schema to JavaScript

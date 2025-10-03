@@ -1,7 +1,7 @@
 import * as wasm from "../../pkg/node/parquet_wasm";
 import { readFileSync } from "fs";
 import * as arrow from "apache-arrow";
-import { readExpectedArrowData, extractFooterBytes } from "./utils";
+import { readExpectedArrowData, extractFooterBytes, extractRowGroupBytes } from "./utils";
 import { parseSchema } from "arrow-js-ffi";
 import { it, expect } from "vitest";
 
@@ -60,6 +60,7 @@ it("read metadata from full file bytes", async (t) => {
   expect(metadata.numRowGroups()).toStrictEqual(expectedMetadata.numRowGroups());
   expect(metadata.rowGroup(0).numRows()).toStrictEqual(expectedMetadata.rowGroup(0).numRows());
   expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).compressedSize()).toStrictEqual(289);
   expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(269);
 });
 
@@ -83,5 +84,36 @@ it("read metadata from footer bytes only", async (t) => {
   expect(metadata.numRowGroups()).toStrictEqual(expectedMetadata.numRowGroups());
   expect(metadata.rowGroup(0).numRows()).toStrictEqual(expectedMetadata.rowGroup(0).numRows());
   expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).compressedSize()).toStrictEqual(289);
   expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(269);
 });
+
+it("read single row group from bytes", async (t) => {
+  const dataPath = `${dataDir}/1-partition-brotli.parquet`;
+  const buffer = readFileSync(dataPath);
+  const arr = new Uint8Array(buffer);
+  const footerBytes = extractFooterBytes(arr);
+  const metadata = wasm.readMetadata(footerBytes);
+
+  // Convert the parquet file buffer from readFileSync to a Blob.
+  const blob = new Blob([buffer], { type: "application/octet-stream" });
+  const pqFile = await wasm.ParquetFile.fromFile(blob);
+  
+  // TODO: test with a file that contains multiple row groups
+  expect(metadata.numRowGroups()).toStrictEqual(1);
+  expect(metadata.rowGroup(0).numRows()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).fileOffset()).toStrictEqual(4);
+  expect(metadata.rowGroup(0).compressedSize()).toStrictEqual(289);
+  expect(metadata.rowGroup(0).totalByteSize()).toStrictEqual(269);
+
+  const rowGroupBytes = extractRowGroupBytes(arr, metadata, 0);
+  expect(rowGroupBytes.length).toStrictEqual(289);
+
+  const rowGroupTable = arrow.tableFromIPC(wasm.readParquetRowGroup(footerBytes, rowGroupBytes, 0).intoIPCStream());
+
+  console.log(rowGroupTable);
+
+  expect(rowGroupTable.schema.fields.length).toStrictEqual(4);
+  expect(rowGroupTable.numRows).toStrictEqual(4);
+});
+
