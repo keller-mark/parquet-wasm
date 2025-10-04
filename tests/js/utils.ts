@@ -80,11 +80,8 @@ export async function temporaryServer() {
 export function extractRowGroupBytes(parquetFile: Uint8Array, metadata: wasm.ParquetMetaData, rowGroupIndex: number): Uint8Array {
   const rowGroup = metadata.rowGroup(rowGroupIndex);
   const fileOffset = rowGroup.fileOffset();
-  console.log("fileOffset", fileOffset);
-  const totalByteSize = rowGroup.totalByteSize();
   const compressedSize = rowGroup.compressedSize();
-  // TODO: use compressedSize or totalByteSize?
-  return new Uint8Array(Array.from(parquetFile.slice(fileOffset, fileOffset + compressedSize)));
+  return parquetFile.slice(fileOffset, fileOffset + compressedSize);
 }
 
 export function extractFooterBytes(parquetFile: Uint8Array): Uint8Array {
